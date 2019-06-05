@@ -15,7 +15,7 @@ fn main() {
 
     server::new(|| {
         App::new()
-            .middleware(SentryMiddleware::builder().emit_header(true).finish())
+            .wrap(SentryHandler::builder().emit_header(true).finish())
             .resource("/", |r| r.f(failing))
     })
     .bind("127.0.0.1:3001")

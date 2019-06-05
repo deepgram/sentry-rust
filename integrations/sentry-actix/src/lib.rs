@@ -79,22 +79,29 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
-use actix_web::middleware::{Finished, Middleware, Response, Started};
-use actix_web::{Error, HttpMessage, HttpRequest, HttpResponse};
+use actix_service::{Service, Transform};
+use actix_web::{
+    dev::{ServiceRequest, ServiceResponse},
+    Error, HttpMessage, HttpRequest,
+    http::header::HeaderName,
+};
 use failure::Fail;
-use sentry::integrations::failure::exception_from_single_fail;
-use sentry::internals::{ScopeGuard, Uuid};
-use sentry::protocol::{ClientSdkPackage, Event, Level};
-use sentry::Hub;
+use futures::{future::{self, FutureResult}, Future, Poll};
+use sentry::{
+    integrations::failure::exception_from_single_fail,
+    internals::{ScopeGuard, Uuid},
+    protocol::{ClientSdkPackage, Event, Level},
+    Hub,
+};
 
 /// A helper construct that can be used to reconfigure and build the middleware.
-pub struct SentryMiddlewareBuilder {
-    middleware: SentryMiddleware,
+pub struct SentryHandlerBuilder {
+    middleware: SentryHandler,
 }
 
-impl SentryMiddlewareBuilder {
+impl SentryHandlerBuilder {
     /// Finishes the building and returns a middleware
-    pub fn finish(self) -> SentryMiddleware {
+    pub fn finish(self) -> SentryHandler {
         self.middleware
     }
 
@@ -112,7 +119,7 @@ impl SentryMiddlewareBuilder {
 
     /// If configured the sentry id is attached to a X-Sentry-Event header.
     pub fn emit_header(mut self, val: bool) -> Self {
-        self.middleware.emit_header = val;
+        self.middleware.header = if val { Some(HeaderName::from_static("x-sentry-event")) } else { None };
         self
     }
 
@@ -126,9 +133,10 @@ impl SentryMiddlewareBuilder {
 }
 
 /// Reports certain failures to sentry.
-pub struct SentryMiddleware {
+#[derive(Clone)]
+pub struct SentryHandler {
     hub: Option<Arc<Hub>>,
-    emit_header: bool,
+    header: Option<HeaderName>,
     capture_server_errors: bool,
 }
 
@@ -137,24 +145,24 @@ struct HubWrapper {
     root_scope: RefCell<Option<ScopeGuard>>,
 }
 
-impl SentryMiddleware {
+impl SentryHandler {
     /// Creates a new sentry middleware.
-    pub fn new() -> SentryMiddleware {
-        SentryMiddleware {
+    pub fn new() -> Self {
+        Self {
             hub: None,
-            emit_header: false,
+            header: None,
             capture_server_errors: true,
         }
     }
 
     /// Creates a new middleware builder.
-    pub fn builder() -> SentryMiddlewareBuilder {
-        SentryMiddleware::new().into_builder()
+    pub fn builder() -> SentryHandlerBuilder {
+        Self::new().into_builder()
     }
 
     /// Converts the middleware into a builder.
-    pub fn into_builder(self) -> SentryMiddlewareBuilder {
-        SentryMiddlewareBuilder { middleware: self }
+    pub fn into_builder(self) -> SentryHandlerBuilder {
+        SentryHandlerBuilder { middleware: self }
     }
 
     fn new_hub(&self) -> Arc<Hub> {
@@ -162,36 +170,98 @@ impl SentryMiddleware {
     }
 }
 
-impl Default for SentryMiddleware {
+impl Default for SentryHandler {
     fn default() -> Self {
-        SentryMiddleware::new()
+        Self::new()
     }
 }
 
-fn extract_request<S: 'static>(
-    req: &HttpRequest<S>,
+impl<S, B> Transform<S> for SentryHandler
+where
+    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S::Future: 'static,
+    B: 'static,
+{
+    type Request = ServiceRequest;
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type InitError = ();
+    type Transform = SentryMiddleware<S>;
+    type Future = FutureResult<Self::Transform, Self::InitError>;
+
+    fn new_transform(&self, service: S) -> Self::Future {
+        future::ok(SentryMiddleware {
+            service,
+            inner: self.clone(),
+        })
+    }
+}
+
+/// The pieces of data from an HttpRequest we actually need
+struct RequestBits {
+    conn_info: actix_web::dev::ConnectionInfo,
+    uri: actix_web::http::uri::Uri,
+    method: actix_web::http::Method,
+    headers: actix_web::http::header::HeaderMap,
+}
+
+impl From<&ServiceRequest> for RequestBits {
+    fn from(req: &ServiceRequest) -> Self {
+        // The HttpRequest inside the ServiceRequest has an Rc<RequestHead>
+        // of which contains the headermap, so cloning is just bumping the
+        // ref count, but that Rc isn't exposed anywhere, and headermap is
+        // not itself clonable, so for now, just manually copy the headermap
+        // until the API makes this better...someday
+        let headers = {
+            let headers = req.headers();
+            let mut hm = actix_web::http::header::HeaderMap::with_capacity(headers.len());
+
+            for (k, v) in headers {
+                hm.append(k.clone(), v.clone());
+            }
+
+            hm
+        };
+
+        Self {
+            conn_info: req.connection_info().clone(),
+            uri: req.uri().clone(),
+            method: *req.method(),
+            headers,
+        }
+    }
+}
+
+fn extract_request(
+    req: &RequestBits,
     with_pii: bool,
 ) -> (Option<String>, sentry::protocol::Request) {
-    let resource = req.resource();
-    let transaction = if let Some(rdef) = resource.rdef() {
-        Some(rdef.pattern().to_string())
-    } else if resource.name() != "" {
-        Some(resource.name().to_string())
-    } else {
-        None
-    };
+    // There doesn't seem to be a way to retrieve the resource
+    // definition that matches a request any longer, at least
+    // from the public API
+
+    // let resource = req.resource();
+    // let transaction = if let Some(rdef) = resource.rdef() {
+    //     Some(rdef.pattern().to_string())
+    // } else if resource.name() != "" {
+    //     Some(resource.name().to_string())
+    // } else {
+    //     None
+    // };
+    let transaction = None;
+
     let mut sentry_req = sentry::protocol::Request {
         url: format!(
             "{}://{}{}",
-            req.connection_info().scheme(),
-            req.connection_info().host(),
-            req.uri()
+            req.conn_info.scheme(),
+            req.conn_info.host(),
+            req.uri,
         )
         .parse()
         .ok(),
-        method: Some(req.method().to_string()),
+        method: Some(req.method.to_string()),
         headers: req
-            .headers()
+            .headers
             .iter()
             .map(|(k, v)| (k.as_str().into(), v.to_str().unwrap_or("").into()))
             .collect(),
@@ -199,7 +269,7 @@ fn extract_request<S: 'static>(
     };
 
     if with_pii {
-        if let Some(remote) = req.connection_info().remote() {
+        if let Some(remote) = req.conn_info.remote() {
             sentry_req.env.insert("REMOTE_ADDR".into(), remote.into());
         }
     };
@@ -207,11 +277,30 @@ fn extract_request<S: 'static>(
     (transaction, sentry_req)
 }
 
-impl<S: 'static> Middleware<S> for SentryMiddleware {
-    fn start(&self, req: &HttpRequest<S>) -> Result<Started, Error> {
-        let hub = self.new_hub();
+pub struct SentryMiddleware<S> {
+    service: S,
+    inner: SentryHandler,
+}
+
+impl<S, B> Service for SentryMiddleware<S>
+where
+    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S::Future: 'static,
+    B: 'static,
+{
+    type Request = ServiceRequest;
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
+
+    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+        self.service.poll_ready()
+    }
+
+    fn call(&mut self, req: ServiceRequest) -> Self::Future {
+        let hub = self.inner.new_hub();
         let outer_req = req;
-        let req = outer_req.clone();
+        let req = RequestBits::from(&outer_req);
         let client = hub.client();
 
         let req = fragile::SemiSticky::new(req);
@@ -254,46 +343,47 @@ impl<S: 'static> Middleware<S> for SentryMiddleware {
             hub,
             root_scope: RefCell::new(Some(root_scope)),
         });
-        Ok(Started::Done)
-    }
 
-    fn response(&self, req: &HttpRequest<S>, mut resp: HttpResponse) -> Result<Response, Error> {
-        if self.capture_server_errors && resp.status().is_server_error() {
-            let event_id = if let Some(error) = resp.error() {
-                Some(Hub::from_request(req).capture_actix_error(error))
-            } else {
-                None
-            };
-            match event_id {
-                Some(event_id) if self.emit_header => {
-                    resp.headers_mut().insert(
-                        "x-sentry-event",
-                        event_id.to_simple_ref().to_string().parse().unwrap(),
-                    );
+        let inner = self.inner.clone();
+
+        Box::new(self.service.call(outer_req).and_then(move |resp| {
+            if inner.capture_server_errors && resp.status().is_server_error() {
+                let event_id = if let Some(error) = resp.response().error() {
+                    Some(Hub::from_request(resp.request()).capture_actix_error(error))
+                } else {
+                    None
+                };
+                match event_id {
+                    Some(event_id) => {
+                        if let Some(header) = inner.header {
+                            resp.headers_mut().insert(
+                                header,
+                                event_id.to_simple_ref().to_string().parse().unwrap(),
+                            );
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        Ok(Response::Done(resp))
-    }
 
-    fn finish(&self, req: &HttpRequest<S>, _resp: &HttpResponse) -> Finished {
-        // if we make it to the end of the request we want to first drop the root
-        // scope before we drop the entire hub.  This will first drop the closures
-        // on the scope which in turn will release the circular dependency we have
-        // with the hub via the request.
-        if let Some(hub_wrapper) = req.extensions().get::<HubWrapper>() {
-            if let Ok(mut guard) = hub_wrapper.root_scope.try_borrow_mut() {
-                guard.take();
+            // if we make it to the end of the request we want to first drop the root
+            // scope before we drop the entire hub.  This will first drop the closures
+            // on the scope which in turn will release the circular dependency we have
+            // with the hub via the request.
+            if let Some(hub_wrapper) = resp.request().extensions().get::<HubWrapper>() {
+                if let Ok(mut guard) = hub_wrapper.root_scope.try_borrow_mut() {
+                    guard.take();
+                }
             }
-        }
-        Finished::Done
+
+            resp
+        }))
     }
 }
 
 /// Utility function that takes an actix error and reports it to the default hub.
 ///
-/// This is typically not very since the actix hub is likely never bound as the
+/// This is typically not very useful since the actix hub is likely never bound as the
 /// default hub.  It's generally recommended to use the `ActixWebHubExt` trait's
 /// extension method on the hub instead.
 pub fn capture_actix_error(err: &Error) -> Uuid {
@@ -306,13 +396,13 @@ pub trait ActixWebHubExt {
     ///
     /// This requires that the `SentryMiddleware` middleware has been enabled or the
     /// call will panic.
-    fn from_request<S>(req: &HttpRequest<S>) -> Arc<Hub>;
+    fn from_request(req: &HttpRequest) -> Arc<Hub>;
     /// Captures an actix error on the given hub.
     fn capture_actix_error(&self, err: &Error) -> Uuid;
 }
 
 impl ActixWebHubExt for Hub {
-    fn from_request<S>(req: &HttpRequest<S>) -> Arc<Hub> {
+    fn from_request(req: &HttpRequest) -> Arc<Hub> {
         req.extensions()
             .get::<HubWrapper>()
             .expect("SentryMiddleware middleware was not registered")
