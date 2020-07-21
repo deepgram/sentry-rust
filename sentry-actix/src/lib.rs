@@ -1,3 +1,5 @@
+#![feature(backtrace)]
+
 //! This crate adds a middleware for [`actix-web`](https://actix.rs/) that captures errors and
 //! report them to `Sentry`.
 //!
@@ -66,21 +68,23 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{self, Poll};
 
-use actix_service::{Service, Transform};
 use actix_web::{
-    dev::{ServiceRequest, ServiceResponse},
-    Error, HttpMessage, HttpRequest,
+    dev::{Service, ServiceRequest, ServiceResponse, Transform},
     http::header::HeaderName,
+    Error, HttpMessage, HttpRequest,
 };
-use failure::Fail;
-use futures::{future::{self, FutureResult}, Future, Poll};
+use futures::future;
 use sentry::{
-    integrations::failure::exception_from_single_fail,
-    internals::{ScopeGuard, Uuid},
-    protocol::{ClientSdkPackage, Event, Level},
-    Hub,
+    integrations::backtrace::parse_stacktrace,
+    internals::Uuid,
+    parse_type_from_debug,
+    protocol::{ClientSdkPackage, Event, Exception, Level},
+    Hub, ScopeGuard,
 };
 
 /// A helper construct that can be used to reconfigure and build the middleware.
@@ -108,7 +112,11 @@ impl SentryHandlerBuilder {
 
     /// If configured the sentry id is attached to a X-Sentry-Event header.
     pub fn emit_header(mut self, val: bool) -> Self {
-        self.middleware.header = if val { Some(HeaderName::from_static("x-sentry-event")) } else { None };
+        self.middleware.header = if val {
+            Some(HeaderName::from_static("x-sentry-event"))
+        } else {
+            None
+        };
         self
     }
 
@@ -176,7 +184,7 @@ where
     type Error = Error;
     type InitError = ();
     type Transform = SentryMiddleware<S>;
-    type Future = FutureResult<Self::Transform, Self::InitError>;
+    type Future = future::Ready<Result<Self::Transform, Self::InitError>>;
 
     fn new_transform(&self, service: S) -> Self::Future {
         future::ok(SentryMiddleware {
@@ -215,7 +223,7 @@ impl From<&ServiceRequest> for RequestBits {
         Self {
             conn_info: req.connection_info().clone(),
             uri: req.uri().clone(),
-            method: *req.method(),
+            method: req.method().clone(),
             headers,
         }
     }
@@ -280,10 +288,10 @@ where
     type Request = ServiceRequest;
     type Response = ServiceResponse<B>;
     type Error = Error;
-    type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
 
-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
-        self.service.poll_ready()
+    fn poll_ready(&mut self, ctx: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.service.poll_ready(ctx)
     }
 
     fn call(&mut self, req: ServiceRequest) -> Self::Future {
@@ -335,7 +343,10 @@ where
 
         let inner = self.inner.clone();
 
-        Box::new(self.service.call(outer_req).and_then(move |resp| {
+        let resp_future = self.service.call(outer_req);
+
+        Box::pin(async {
+            let mut resp = resp_future.await?;
             if inner.capture_server_errors && resp.status().is_server_error() {
                 let event_id = if let Some(error) = resp.response().error() {
                     Some(Hub::from_request(resp.request()).capture_actix_error(error))
@@ -365,8 +376,8 @@ where
                 }
             }
 
-            resp
-        }))
+            Ok(resp)
+        })
     }
 }
 
@@ -401,27 +412,10 @@ impl ActixWebHubExt for Hub {
 
     fn capture_actix_error(&self, err: &Error) -> Uuid {
         let mut exceptions = vec![];
-        let mut ptr: Option<&dyn Fail> = Some(err.as_fail());
-        let mut idx = 0;
+        let mut ptr: Option<&dyn std::error::Error> = Some(err);
         while let Some(fail) = ptr {
-            // Check whether the failure::Fail held by err is a failure::Error wrapped in Compat
-            // If that's the case, we should be logging that error and its fail instead of the wrapper's construction in actix_web
-            // This wouldn't be necessary if failure::Compat<failure::Error>'s Fail::backtrace() impl was not "|| None",
-            // that is however impossible to do as of now because it conflicts with the generic implementation of Fail also provided in failure.
-            // Waiting for update that allows overlap, (https://github.com/rust-lang/rfcs/issues/1053), but chances are by then failure/std::error will be refactored anyway
-            let compat: Option<&failure::Compat<failure::Error>> = fail.downcast_ref();
-            let failure_err = compat.map(failure::Compat::get_ref);
-            let fail = failure_err.map_or(fail, |x| x.as_fail());
-            exceptions.push(exception_from_single_fail(
-                fail,
-                if idx == 0 {
-                    Some(failure_err.map_or_else(|| err.backtrace(), |err| err.backtrace()))
-                } else {
-                    fail.backtrace()
-                },
-            ));
-            ptr = fail.cause();
-            idx += 1;
+            exceptions.push(exception_from_error(fail, fail.backtrace()));
+            ptr = fail.source();
         }
         exceptions.reverse();
         self.capture_event(Event {
@@ -429,5 +423,28 @@ impl ActixWebHubExt for Hub {
             level: Level::Error,
             ..Default::default()
         })
+    }
+}
+
+/// This converts a single fail instance into an exception.
+///
+/// This is typically not very useful as the `event_from_error` and
+/// `event_from_fail` methods will assemble an entire event with all the
+/// causes of a failure, however for certain more complex situations where
+/// fails are contained within a non fail error type that might also carry
+/// useful information it can be useful to call this method instead.
+pub fn exception_from_error(
+    f: &dyn std::error::Error,
+    bt: Option<&std::backtrace::Backtrace>,
+) -> Exception {
+    let dbg = format!("{:?}", f);
+    Exception {
+        ty: parse_type_from_debug(&dbg).to_owned(),
+        value: Some(f.to_string()),
+        stacktrace: bt
+            // format the stack trace with alternate debug to get addresses
+            .map(|bt| format!("{:#?}", bt))
+            .and_then(|x| parse_stacktrace(&x)),
+        ..Default::default()
     }
 }
