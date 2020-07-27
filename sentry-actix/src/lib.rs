@@ -266,7 +266,7 @@ fn extract_request(
     };
 
     if with_pii {
-        if let Some(remote) = req.conn_info.remote() {
+        if let Some(remote) = req.conn_info.realip_remote_addr() {
             sentry_req.env.insert("REMOTE_ADDR".into(), remote.into());
         }
     };
