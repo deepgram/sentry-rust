@@ -1,5 +1,3 @@
-#![feature(backtrace)]
-
 //! This crate adds a middleware for [`actix-web`](https://actix.rs/) that captures errors and
 //! report them to `Sentry`.
 //!
@@ -80,7 +78,6 @@ use actix_web::{
 };
 use futures::future;
 use sentry::{
-    integrations::backtrace::parse_stacktrace,
     internals::Uuid,
     parse_type_from_debug,
     protocol::{ClientSdkPackage, Event, Exception, Level},
@@ -414,7 +411,7 @@ impl ActixWebHubExt for Hub {
         let mut exceptions = vec![];
         let mut ptr: Option<&dyn std::error::Error> = Some(err);
         while let Some(fail) = ptr {
-            exceptions.push(exception_from_error(fail, fail.backtrace()));
+            exceptions.push(exception_from_error(fail));
             ptr = fail.source();
         }
         exceptions.reverse();
@@ -435,16 +432,11 @@ impl ActixWebHubExt for Hub {
 /// useful information it can be useful to call this method instead.
 pub fn exception_from_error(
     f: &dyn std::error::Error,
-    bt: Option<&std::backtrace::Backtrace>,
 ) -> Exception {
     let dbg = format!("{:?}", f);
     Exception {
         ty: parse_type_from_debug(&dbg).to_owned(),
         value: Some(f.to_string()),
-        stacktrace: bt
-            // format the stack trace with alternate debug to get addresses
-            .map(|bt| format!("{:#?}", bt))
-            .and_then(|x| parse_stacktrace(&x)),
         ..Default::default()
     }
 }
